@@ -49,10 +49,14 @@ count_t word_count(FILE* fp, long offset, long size)
 	while ((ch=getc(fp)) != EOF && rbytes < size) {
 
 		// Increment character count if NOT new line or space
-		if (ch != ' ' && ch != '\n') { ++count.charcount; }
+		if (ch != ' ' && ch != '\n') { 
+			++count.charcount; 
+		}
 
 		// Increment word count if new line or space character
-		if (ch == ' ' || ch == '\n') { ++count.wordcount; }
+		if (ch == ' ' || ch == '\n') { 
+			++count.wordcount; 
+		}
 
 		// Increment line count if new line character
 		if (ch == '\n') { ++count.linecount; }
@@ -119,15 +123,17 @@ int main(int argc, char **argv)
 		parent collects all process results and compiles them
 	*/
 
-	long base_chunk_size = fsize/numJobs;
-	long remainder = fsize%numJobs; // handle division issue ******
+	long base_chunk_size = fsize / numJobs;
+	long remainder = fsize % numJobs; // handle division issue ******
 	long current_offset = 0;
 
 	for(i = 0; i < numJobs; i++) {
 		
 		long current_chunk_size = base_chunk_size;
-		plist[i].offset = current_offset;
+		plist[i].offset = current_offset; // 0
 		
+		if (i < remainder) current_chunk_size++;
+
 		if (pipe(plist[i].pipefd) == -1) {
 			fprintf(stderr, "Fork Failed");
 			return 1;
@@ -137,10 +143,7 @@ int main(int argc, char **argv)
 
 		if((plist[i].pid = fork()) < 0) {
 			printf("Fork failed.\n");
-		} else if(plist[i].pid == 0) {
-
-			long current_chunk_size = base_chunk_size;
-			if (i < remainder) current_chunk_size++;
+		} else if(plist[i].pid == 0) {			
 			
 			fp = fopen(argv[2], "r");
 			count = word_count(fp, plist[i].offset, current_chunk_size);
@@ -158,6 +161,7 @@ int main(int argc, char **argv)
 		}
 	}
 
+	// parent fork
 	while (nFork > 0) {
 
 		if ((pid = waitpid(-1, &status, 0)) > 0) {
