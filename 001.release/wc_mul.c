@@ -7,11 +7,14 @@
 #include <stdlib.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <time.h>
+#include <stdint.h>
 
 #define MAX_PROC 100
 #define MAX_FORK 1000
 #define READ_END 0
 #define WRITE_END 1
+#define MAX_RETRIES 10
 
 typedef struct count_t {
 	int linecount;
@@ -19,13 +22,14 @@ typedef struct count_t {
 	int charcount;
 } count_t;
 
-
 typedef struct plist_t {
 	int pid;
 	int offset;
 	int pipefd[2];
+	long current_chunk_size;
+	int retries;
+	int complete;
 } plist_t;
-
 
 int CRASH = 0;
 
@@ -35,7 +39,6 @@ count_t word_count(FILE* fp, long offset, long size)
 	long rbytes = 0;
 
 	count_t count;
-	// Initialize counter variables
 	count.linecount = 0;
 	count.wordcount = 0;
 	count.charcount = 0;
@@ -49,17 +52,12 @@ count_t word_count(FILE* fp, long offset, long size)
 	while ((ch=getc(fp)) != EOF && rbytes < size) {
 
 		// Increment character count if NOT new line or space
-		if (ch != ' ' && ch != '\n') { 
-			++count.charcount; 
-		}
-
+		if (ch != ' ' && ch != '\n') ++count.charcount;
 		// Increment word count if new line or space character
-		if (ch == ' ' || ch == '\n') { 
-			++count.wordcount; 
-		}
-
+		if (ch == ' ' || ch == '\n') ++count.wordcount;
 		// Increment line count if new line character
-		if (ch == '\n') { ++count.linecount; }
+		if (ch == '\n') ++count.linecount;
+		
 		rbytes++;
 	}
 
@@ -99,9 +97,7 @@ int main(int argc, char **argv)
 	numJobs = atoi(argv[1]);
 	if(numJobs > MAX_PROC) numJobs = MAX_PROC;
 
-	total.linecount = 0;
-	total.wordcount = 0;
-	total.charcount = 0;
+	total.linecount = total.wordcount = total.charcount = 0;
 
 	// Open file in read-only mode
 	fp = fopen(argv[2], "r");
@@ -116,23 +112,16 @@ int main(int argc, char **argv)
 	fsize = ftell(fp);
 	fclose(fp);
 
-	/**
-		get number of processes to fork, fork that many times
-		each child gets its own portion of the file to process
-		once complete, pipes the result to the parent process
-		parent collects all process results and compiles them
-	*/
-
 	long base_chunk_size = fsize / numJobs;
-	long remainder = fsize % numJobs; // handle division issue ******
+	long remainder = fsize % numJobs;
 	long current_offset = 0;
 
 	for(i = 0; i < numJobs; i++) {
 		
-		long current_chunk_size = base_chunk_size;
-		plist[i].offset = current_offset; // 0
-		
-		if (i < remainder) current_chunk_size++;
+		plist[i].current_chunk_size = base_chunk_size + (i < remainder ? 1 : 0);
+		plist[i].offset = current_offset;
+		plist[i].retries = 0;
+		plist[i].complete = 0;
 
 		if (pipe(plist[i].pipefd) == -1) {
 			fprintf(stderr, "Fork Failed");
@@ -143,46 +132,87 @@ int main(int argc, char **argv)
 
 		if((plist[i].pid = fork()) < 0) {
 			printf("Fork failed.\n");
-		} else if(plist[i].pid == 0) {			
+		} else if(plist[i].pid == 0) {
 			
 			fp = fopen(argv[2], "r");
-			count = word_count(fp, plist[i].offset, current_chunk_size);
-			
+			count_t count = word_count(fp, plist[i].offset, plist[i].current_chunk_size);
 			close(plist[i].pipefd[READ_END]); 
 			write(plist[i].pipefd[WRITE_END], &count, sizeof(count));
-
 			fclose(fp);
 			close(plist[i].pipefd[WRITE_END]); 
-
 			return 0;
+
 		} else if (plist[i].pid > 0) {
+
 			close(plist[i].pipefd[WRITE_END]);
-			current_offset += current_chunk_size;
+			current_offset += plist[i].current_chunk_size;
+
 		}
 	}
 
-	// parent fork
 	while (nFork > 0) {
+		pid = waitpid(-1, &status, 0);
+		for (i = 0; i < numJobs; i++) {
+				
+			if (plist[i].pid == pid && !plist[i].complete) {
 
-		if ((pid = waitpid(-1, &status, 0)) > 0) {
+				count_t temp;
+				ssize_t bytesRead = 0;
+				char *ptr = (char*)&temp;
 
-			for (i = 0; i < numJobs; i++) {
-				if (plist[i].pid == pid) {
-					count_t temp;
-					read(plist[i].pipefd[READ_END], &temp, sizeof(temp));
-
-					total.linecount += temp.linecount;
-					total.wordcount += temp.wordcount;
-					total.charcount += temp.charcount;
-
-					close(plist[i].pipefd[READ_END]);
-					nFork--;
-					break;
+				while (bytesRead < sizeof(temp)) {
+					ssize_t n = read(plist[i].pipefd[READ_END], ptr + bytesRead, sizeof(temp) - bytesRead);
+					if (n <= 0) break;
+					bytesRead += n;
 				}
-			}
 
-		} else {
-			// error handling
+				close(plist[i].pipefd[READ_END]);
+			
+				if (WIFEXITED(status)) { 
+						
+					if (bytesRead == sizeof(temp)) {
+						total.linecount += temp.linecount;
+						total.wordcount += temp.wordcount;
+						total.charcount += temp.charcount;
+					}
+
+					plist[i].complete = 1;
+					nFork--;
+
+				} else if (WIFSIGNALED(status)) {
+						
+					if(plist[i].retries++ >= MAX_RETRIES) {
+                       	printf("[offset %d] reached max retries\n", plist[i].offset);
+                       	plist[i].complete = 1;
+                       	nFork--;
+                       	break;
+                   	}
+
+					if (pipe(plist[i].pipefd) == -1) {
+						fprintf(stderr, "Fork Failed");
+						return 1;
+					}
+					if((plist[i].pid = fork()) < 0) {
+						printf("Fork failed.\n");
+					} else if (plist[i].pid == 0) {
+
+						fp = fopen(argv[2], "r");
+						count_t count = word_count(fp, plist[i].offset, plist[i].current_chunk_size);
+						close(plist[i].pipefd[READ_END]); 
+						write(plist[i].pipefd[WRITE_END], &count, sizeof(count));
+
+						fclose(fp);
+						close(plist[i].pipefd[WRITE_END]);
+
+						printf("retry child: %d\n", i);
+
+						return 0;
+					} else {
+						close(plist[i].pipefd[WRITE_END]);
+					}
+				}
+				break;
+			} 
 		}
 	}
 
