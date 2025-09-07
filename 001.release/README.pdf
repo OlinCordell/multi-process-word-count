@@ -1,0 +1,17 @@
+This program implements a multiprocess word count utility in C that counts lines, 
+words, and characters in a file. The file is divided into chunks based on the number 
+of child processes specified by the user, and each chunk is processed concurrently by a 
+separate child. Each child opens the file, seeks to its assigned offset, counts the data, 
+and sends the results to the parent via pipes. The parent reads the results from the 
+pipes and aggregates them to compute the total counts.
+
+To simulate and handle failures, child processes may randomly crash based on a configurable crash rate. 
+The parent monitors each child using waitpid(). If a child crashes or fails to return a complete result, 
+the parent retries the job up to a maximum number of retries (MAX_RETRIES). If a job continues to fail 
+after the maximum retries, the parent marks it complete and prints a warning that totals may be incomplete. 
+This ensures fault tolerance while preventing the parent from crashing.
+
+The program demonstrates multiprocessing, inter-process communication via pipes, 
+and robust crash handling, while producing accurate totals whenever possible. 
+Users can specify the number of processes and crash rate, making it suitable for performance 
+testing and reliability demonstrations on Unix-like systems.

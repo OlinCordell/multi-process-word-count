@@ -9,6 +9,8 @@
 #include <unistd.h>
 #include <time.h>
 #include <stdint.h>
+#include <errno.h>
+#include <fcntl.h>
 
 #define MAX_PROC 100
 #define MAX_FORK 1000
@@ -39,9 +41,7 @@ count_t word_count(FILE* fp, long offset, long size)
 	long rbytes = 0;
 
 	count_t count;
-	count.linecount = 0;
-	count.wordcount = 0;
-	count.charcount = 0;
+	count.linecount = count.wordcount = count.charcount = 0;
 
 	printf("[pid %d] reading %ld bytes from offset %ld\n", getpid(), size, offset);
 
@@ -51,11 +51,8 @@ count_t word_count(FILE* fp, long offset, long size)
 
 	while ((ch=getc(fp)) != EOF && rbytes < size) {
 
-		// Increment character count if NOT new line or space
 		if (ch != ' ' && ch != '\n') ++count.charcount;
-		// Increment word count if new line or space character
 		if (ch == ' ' || ch == '\n') ++count.wordcount;
-		// Increment line count if new line character
 		if (ch == '\n') ++count.linecount;
 		
 		rbytes++;
@@ -79,7 +76,7 @@ int main(int argc, char **argv)
 	plist_t plist[MAX_PROC];
 	count_t total, count;
 	int i, pid, status;
-	int nFork = 0;
+	int nFork = 0, incomplete = 0;
 
 	if(argc < 3) {
 		printf("usage: wc_mul <# of processes> <filname>\n");
@@ -93,13 +90,11 @@ int main(int argc, char **argv)
 	}
 	printf("CRASH RATE: %d\n", CRASH);
 
-	// number of child processes to fork
 	numJobs = atoi(argv[1]);
 	if(numJobs > MAX_PROC) numJobs = MAX_PROC;
 
 	total.linecount = total.wordcount = total.charcount = 0;
 
-	// Open file in read-only mode
 	fp = fopen(argv[2], "r");
 
 	if(fp == NULL) {
@@ -151,7 +146,14 @@ int main(int argc, char **argv)
 	}
 
 	while (nFork > 0) {
+
 		pid = waitpid(-1, &status, 0);
+		if (pid == -1) {
+			if (errno == EINTR) continue;
+        	perror("waitpid");
+        	break;
+		}
+
 		for (i = 0; i < numJobs; i++) {
 				
 			if (plist[i].pid == pid && !plist[i].complete) {
@@ -162,56 +164,60 @@ int main(int argc, char **argv)
 
 				while (bytesRead < sizeof(temp)) {
 					ssize_t n = read(plist[i].pipefd[READ_END], ptr + bytesRead, sizeof(temp) - bytesRead);
-					if (n <= 0) break;
+                    if (n <= 0) break;
 					bytesRead += n;
 				}
-
-				close(plist[i].pipefd[READ_END]);
 			
-				if (WIFEXITED(status)) { 
-						
-					if (bytesRead == sizeof(temp)) {
-						total.linecount += temp.linecount;
-						total.wordcount += temp.wordcount;
-						total.charcount += temp.charcount;
-					}
+				if (WIFEXITED(status) && bytesRead == sizeof(temp)) { 
+					
+					total.linecount += temp.linecount;
+					total.wordcount += temp.wordcount;
+					total.charcount += temp.charcount;
 
 					plist[i].complete = 1;
 					nFork--;
 
-				} else if (WIFSIGNALED(status)) {
-						
+				} else {
+
 					if(plist[i].retries++ >= MAX_RETRIES) {
                        	printf("[offset %d] reached max retries\n", plist[i].offset);
+						incomplete = 0;
                        	plist[i].complete = 1;
                        	nFork--;
                        	break;
                    	}
 
 					if (pipe(plist[i].pipefd) == -1) {
-						fprintf(stderr, "Fork Failed");
+						fprintf(stderr, "Pipe Failed");
 						return 1;
 					}
 					if((plist[i].pid = fork()) < 0) {
-						printf("Fork failed.\n");
-					} else if (plist[i].pid == 0) {
+						printf("Fork Failed.\n");
+						return 1;
+					}
+
+					else if (plist[i].pid == 0) {
 
 						fp = fopen(argv[2], "r");
+						if (!fp) {
+                        	perror("fopen");
+                        	exit(1);
+                    	}
+
 						count_t count = word_count(fp, plist[i].offset, plist[i].current_chunk_size);
+						fclose(fp);
+
 						close(plist[i].pipefd[READ_END]); 
 						write(plist[i].pipefd[WRITE_END], &count, sizeof(count));
-
-						fclose(fp);
+						
 						close(plist[i].pipefd[WRITE_END]);
-
-						printf("retry child: %d\n", i);
 
 						return 0;
 					} else {
 						close(plist[i].pipefd[WRITE_END]);
 					}
 				}
-				break;
+				break;				
 			} 
 		}
 	}
@@ -221,6 +227,11 @@ int main(int argc, char **argv)
 	printf("Total Words : %d \n", total.wordcount);
 	printf("Total Characters : %d \n", total.charcount);
 	printf("=========================================\n");
+
+	if (incomplete) {
+		printf("WARNING: One or more jobs failed after max retries...\n");
+		printf("Totals may be incomplete...Please try again\n");
+	}
 
 	return(0);
 }
