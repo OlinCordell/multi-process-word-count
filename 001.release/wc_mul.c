@@ -7,10 +7,7 @@
 #include <stdlib.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <time.h>
-#include <stdint.h>
 #include <errno.h>
-#include <fcntl.h>
 
 #define MAX_PROC 100
 #define MAX_FORK 1000
